@@ -1,0 +1,459 @@
+"""
+Desktop developer console for the note reader (PySide6).
+
+    .venv\\Scripts\\python -m app.desktop        (or double-click start.bat)
+
+Shows the live camera with the note box and scan state, what the wall would show, every read
+(crop, name, deed, language, timings, raw model answer) and the live log. Each read is play-tested
+here first: Approve / Reject records whether the result is right. Nothing is sent to the wall app
+yet - the HTTP API keeps running in the background for when it is hooked up.
+
+Photos and visitors' words stay in memory only; the log file never contains them.
+"""
+import json
+import sys
+import threading
+import time
+
+from PySide6.QtCore import QObject, QThread, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QFont, QImage, QKeySequence, QPixmap, QShortcut, QTextCursor
+from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QFileDialog, QFormLayout, QFrame,
+                               QGroupBox, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMainWindow,
+                               QPlainTextEdit, QPushButton, QSizePolicy, QSplitter, QVBoxLayout, QWidget)
+
+from . import __version__, engine
+from .detector import normalize_image
+
+cfg, hub, camera, reader, scanner = engine.cfg, engine.hub, engine.camera, engine.reader, engine.scanner
+
+KIND_COLOURS = {"info": "#ffe829", "success": "#a0eb96", "warning": "#ffaa5a", None: "#9aa0a6"}
+REVIEW_TEXT = {None: "not reviewed", "approved": "approved — would send to wall", "rejected": "rejected"}
+LOG_COLOURS = {"error": "#ff7b72", "warn": "#ffaa5a", "info": "#c9d1d9", "debug": "#8b949e"}
+
+STYLE = """
+QWidget { background: #14161a; color: #d7dbe0; font-family: 'Segoe UI'; font-size: 10pt; }
+QGroupBox { border: 1px solid #2b3038; border-radius: 6px; margin-top: 14px; padding: 8px; }
+QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; color: #8b949e; }
+QPushButton { background: #232830; border: 1px solid #353b45; border-radius: 5px; padding: 6px 12px; }
+QPushButton:hover { background: #2c323c; }
+QPushButton:checked { background: #6b4e16; border-color: #a77b22; }
+QPushButton:disabled { color: #5c636d; }
+QPushButton#approve { background: #1f3d24; border-color: #2f6b38; }
+QPushButton#reject { background: #4a1f1f; border-color: #7a3030; }
+QComboBox, QPlainTextEdit, QListWidget { background: #0d0f12; border: 1px solid #2b3038; border-radius: 4px; }
+QPlainTextEdit { font-family: 'Cascadia Mono', 'Consolas'; font-size: 9pt; }
+QLabel#banner { border-radius: 6px; padding: 10px 14px; font-size: 14pt; }
+QLabel#field { font-size: 12pt; color: #ffffff; }
+QLabel#muted { color: #8b949e; }
+QSplitter::handle { background: #1d2127; }
+"""
+
+
+# ---------------------------------------------------------------------- background helpers
+
+class EventPump(QThread):
+    """Pulls engine events (log lines, state changes, read results) and hands them to the UI thread."""
+    events = Signal(list)
+
+    def __init__(self):
+        super().__init__()
+        self._running = True
+
+    def run(self):
+        seq = 0
+        while self._running:
+            items = hub.since(seq, timeout=0.5)
+            if items:
+                seq = items[-1]["seq"]
+                self.events.emit(items)
+
+    def stop(self):
+        self._running = False
+        self.wait(2000)
+
+
+class Worker(QObject):
+    """Runs a blocking call off the UI thread and reports back."""
+    finished = Signal(object)
+
+    def __init__(self, fn):
+        super().__init__()
+        self._fn = fn
+
+    def start(self):
+        def run():
+            try:
+                value = self._fn()
+            except Exception as e:      # reported to the UI, never crashes it
+                value = e
+            self.finished.emit(value)
+        threading.Thread(target=run, daemon=True).start()
+
+
+def to_pixmap(frame_bgr):
+    h, w = frame_bgr.shape[:2]
+    image = QImage(frame_bgr.data, w, h, frame_bgr.strides[0], QImage.Format_BGR888)
+    return QPixmap.fromImage(image.copy())
+
+
+# ---------------------------------------------------------------------- window
+
+class Console(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Good Deed Tree — Note Reader %s (developer console)" % __version__)
+        self.resize(1600, 960)
+        self.entries = {}         # capture id -> history entry (memory only)
+        self.reviews = {}         # capture id -> "approved" / "rejected"
+        self.current_id = None
+        self._workers = []
+        self._model_job = None
+
+        root = QSplitter(Qt.Horizontal)
+        root.addWidget(self._build_left())
+        root.addWidget(self._build_right())
+        root.setStretchFactor(0, 3)
+        root.setStretchFactor(1, 2)
+        self.setCentralWidget(root)
+
+        QShortcut(QKeySequence("C"), self, activated=self.capture)
+        QShortcut(QKeySequence("R"), self, activated=self.relearn)
+        QShortcut(QKeySequence("P"), self, activated=lambda: self.pause_button.toggle())
+        QShortcut(QKeySequence("A"), self, activated=lambda: self.review("approved"))
+        QShortcut(QKeySequence("X"), self, activated=lambda: self.review("rejected"))
+
+        self.video_timer = QTimer(self, interval=66, timeout=self.update_video)       # ~15 fps preview
+        self.status_timer = QTimer(self, interval=1000, timeout=self.update_status)
+        self.video_timer.start()
+        self.status_timer.start()
+
+        self.pump = EventPump()
+        self.pump.events.connect(self.on_events)
+        self.pump.start()
+        self.load_models()
+        self.update_review_buttons()
+
+    # ------------------------------------------------------------------ layout
+
+    def _build_left(self):
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+
+        self.video = QLabel("Waiting for the camera…")
+        self.video.setAlignment(Qt.AlignCenter)
+        self.video.setMinimumSize(640, 360)
+        self.video.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.video.setStyleSheet("background:#000; border-radius:6px; color:#5c636d;")
+        layout.addWidget(self.video, 1)
+
+        self.banner = QLabel()
+        self.banner.setObjectName("banner")
+        self.set_banner(None)
+        layout.addWidget(self.banner)
+
+        controls = QHBoxLayout()
+        self.capture_button = QPushButton("Capture  [C]", clicked=self.capture)
+        self.relearn_button = QPushButton("Relearn desk  [R]", clicked=self.relearn)
+        self.pause_button = QPushButton("Pause  [P]", checkable=True, toggled=self.pause)
+        self.auto_box = QCheckBox("Auto scan", checked=scanner.auto_scan, toggled=self.auto_scan)
+        self.test_button = QPushButton("Test image…", clicked=self.test_image)
+        for w in (self.capture_button, self.relearn_button, self.pause_button, self.auto_box, self.test_button):
+            controls.addWidget(w)
+        controls.addStretch(1)
+        controls.addWidget(QLabel("AI model"))
+        self.model_box = QComboBox()
+        self.model_box.setMinimumWidth(170)
+        self.model_box.activated.connect(self.change_model)
+        controls.addWidget(self.model_box)
+        layout.addLayout(controls)
+
+        self.status_line = QLabel()
+        self.status_line.setObjectName("muted")
+        layout.addWidget(self.status_line)
+        return panel
+
+    def _build_right(self):
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+
+        card = QGroupBox("Read")
+        card_layout = QHBoxLayout(card)
+        self.crop = QLabel("No read yet")
+        self.crop.setAlignment(Qt.AlignCenter)
+        self.crop.setFixedSize(260, 260)
+        self.crop.setStyleSheet("background:#0d0f12; border-radius:4px; color:#5c636d;")
+        card_layout.addWidget(self.crop)
+
+        form = QFormLayout()
+        self.fields = {}
+        for key, label in (("sentence", "Wall leaf"), ("name", "Name"), ("message", "Deed"),
+                           ("as_written", "As written"), ("language", "Language"), ("outcome", "Outcome"),
+                           ("timings", "Timings"), ("model", "Model"), ("review", "Play test")):
+            value = QLabel("—")
+            value.setWordWrap(True)
+            value.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            if key in ("sentence", "name", "message"):
+                value.setObjectName("field")
+            form.addRow(QLabel(label), value)
+            self.fields[key] = value
+        right = QVBoxLayout()
+        right.addLayout(form)
+        buttons = QHBoxLayout()
+        self.approve_button = QPushButton("Approve  [A]", objectName="approve", clicked=lambda: self.review("approved"))
+        self.reject_button = QPushButton("Reject  [X]", objectName="reject", clicked=lambda: self.review("rejected"))
+        buttons.addWidget(self.approve_button)
+        buttons.addWidget(self.reject_button)
+        right.addLayout(buttons)
+        hint = QLabel("Play-test mode: results are not sent to the wall app.")
+        hint.setObjectName("muted")
+        right.addWidget(hint)
+        card_layout.addLayout(right, 1)
+        layout.addWidget(card)
+
+        self.raw = QPlainTextEdit(readOnly=True)
+        self.raw.setPlaceholderText("Raw model answer")
+        self.raw.setMaximumHeight(110)
+        layout.addWidget(self.raw)
+
+        lower = QSplitter(Qt.Vertical)
+        history_box = QGroupBox("History (this session, memory only)")
+        history_layout = QVBoxLayout(history_box)
+        self.history = QListWidget()
+        self.history.currentItemChanged.connect(self.on_history_selected)
+        history_layout.addWidget(self.history)
+        lower.addWidget(history_box)
+
+        log_box = QGroupBox("Log")
+        log_layout = QVBoxLayout(log_box)
+        self.log = QPlainTextEdit(readOnly=True)
+        self.log.setMaximumBlockCount(2000)
+        log_layout.addWidget(self.log)
+        lower.addWidget(log_box)
+        lower.setStretchFactor(0, 1)
+        lower.setStretchFactor(1, 2)
+        layout.addWidget(lower, 1)
+        return panel
+
+    # ------------------------------------------------------------------ live view
+
+    def update_video(self):
+        frame, _ = camera.latest()
+        if frame is None:
+            return
+        view = engine.overlay(frame, width=1280)
+        pixmap = to_pixmap(view)
+        self.video.setPixmap(pixmap.scaled(self.video.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+
+    def update_status(self):
+        s = scanner.status()
+        cam = "%s %dx%d" % (camera.device_name, camera.size[0], camera.size[1]) if camera.ok else "no camera"
+        self.status_line.setText(
+            "Camera: %s   |   AI: %s (%s)   |   State: %s   |   Reads: %d, avg %.1f s   |   Queue: %d" % (
+                cam, reader.model, reader.status, s["state"].replace("_", " "), s["reads"],
+                s["avg_read_ms"] / 1000.0, s["queue"]))
+        if self._model_job is not None and self._model_job.done.is_set():
+            result = self._model_job.result or {}
+            self._model_job = None
+            self.model_box.setEnabled(True)
+            self.select_model(reader.model)
+            if not result.get("ok"):
+                self.append_log("Model switch did not finish: %s" % result.get("status", "unknown"), "warn")
+
+    def set_banner(self, message):
+        if not message:
+            self.banner.setText("Wall would show: (nothing)")
+            self.banner.setStyleSheet("background:#1d2127; color:#8b949e;")
+            return
+        colour = KIND_COLOURS.get(message.get("kind"), "#d7dbe0")
+        text = "Wall would show:  <b>%s</b>" % message["title"]
+        if message.get("sub"):
+            text += "<br><span style='font-size:11pt;color:#c9d1d9'>%s</span>" % message["sub"]
+        self.banner.setText(text)
+        self.banner.setStyleSheet("background:#1d2127; color:%s; border-left:5px solid %s;" % (colour, colour))
+
+    # ------------------------------------------------------------------ events
+
+    def on_events(self, items):
+        for item in items:
+            kind, data = item["kind"], item.get("data") or {}
+            if item.get("text"):
+                self.append_log(item["text"], item.get("level", "info"), item["t"])
+            if kind == "state":
+                self.set_banner(data.get("message"))
+            elif kind == "result":
+                self.add_result(data)
+
+    def append_log(self, text, level="info", t=None):
+        stamp = time.strftime("%H:%M:%S", time.localtime(t or time.time()))
+        colour = LOG_COLOURS.get(level, "#c9d1d9")
+        self.log.appendHtml("<span style='color:#5c636d'>%s</span> <span style='color:%s'>%s</span>" % (
+            stamp, colour, text.replace("&", "&amp;").replace("<", "&lt;")))
+        self.log.moveCursor(QTextCursor.End)
+
+    def add_result(self, entry):
+        self.entries[entry["id"]] = entry
+        code = entry["outcome"]["code"]
+        item = QListWidgetItem(self.history_label(entry))
+        item.setData(Qt.UserRole, entry["id"])
+        item.setForeground(QColor(KIND_COLOURS.get(entry["outcome"]["kind"], "#d7dbe0")))
+        self.history.insertItem(0, item)
+        while self.history.count() > 50:
+            old = self.history.takeItem(self.history.count() - 1)
+            self.entries.pop(old.data(Qt.UserRole), None)
+        self.history.setCurrentItem(item)      # shows it in the card
+        if code == "accepted":
+            QApplication.alert(self)
+
+    def history_label(self, entry):
+        r, o = entry["result"], entry["outcome"]
+        who = o.get("name") or r.get("name") or "?"
+        return "#%d  %s  %-8s  %-20s  %s  [%s]" % (
+            entry["id"], time.strftime("%H:%M:%S", time.localtime(entry["t"])), entry["source"],
+            o["code"], who, self.reviews.get(entry["id"], "-"))
+
+    def on_history_selected(self, item, _previous=None):
+        if item is None:
+            return
+        self.show_entry(self.entries.get(item.data(Qt.UserRole)))
+
+    def show_entry(self, entry):
+        if entry is None:
+            return
+        self.current_id = entry["id"]
+        r, o = entry["result"], entry["outcome"]
+        jpeg = scanner.captures.get(entry["id"])
+        if jpeg:
+            pixmap = QPixmap()
+            pixmap.loadFromData(jpeg)
+            self.crop.setPixmap(pixmap.scaled(self.crop.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        else:
+            self.crop.setText("(photo no longer kept)")
+        f = self.fields
+        f["sentence"].setText(self.wall_sentence(o) if o["code"] == "accepted" else "— (no leaf)")
+        f["name"].setText(r.get("name") or "—")
+        f["message"].setText(r.get("message") or "—")
+        f["as_written"].setText(r.get("message_before_tidy") or "—")
+        f["language"].setText(r.get("language", "?"))
+        f["outcome"].setText("%s — %s" % (o["code"], o["title"]) + ("" if r.get("ok") else "  (error: %s)" % r.get("error")))
+        t = r.get("timings", {})
+        f["timings"].setText("total %.1f s  ·  model %.1f s  ·  tidy %.1f s  ·  load %.1f s" % (
+            t.get("total_ms", 0) / 1000, t.get("model_ms", 0) / 1000, t.get("tidy_ms", 0) / 1000, t.get("load_ms", 0) / 1000))
+        f["model"].setText(r.get("model", "?"))
+        f["review"].setText(REVIEW_TEXT[self.reviews.get(entry["id"])])
+        self.raw.setPlainText(json.dumps(r.get("raw"), ensure_ascii=False, indent=1) if r.get("raw") else "")
+        self.update_review_buttons()
+
+    @staticmethod
+    def wall_sentence(outcome):
+        # Same wording as the wall (DeedSentence): "Name chose to <deed>." for English.
+        name, message = outcome.get("name", ""), outcome.get("message", "")
+        if outcome.get("language") == "en":
+            deed = message[:1].lower() + message[1:] if message[1:2].islower() else message
+            return "<b>%s</b> chose to %s." % (name, deed.rstrip(".!?"))
+        return "<b>%s</b>: %s" % (name, message)
+
+    # ------------------------------------------------------------------ play test
+
+    def review(self, verdict):
+        if self.current_id is None or self.current_id not in self.entries:
+            return
+        self.reviews[self.current_id] = verdict
+        entry = self.entries[self.current_id]
+        # Log line on disk: outcome and verdict only, never the visitor's words.
+        hub.log("Play test: read #%d (%s, %s) %s." % (entry["id"], entry["outcome"]["code"],
+                                                      entry["result"].get("model", "?"), verdict))
+        for i in range(self.history.count()):
+            item = self.history.item(i)
+            if item.data(Qt.UserRole) == entry["id"]:
+                item.setText(self.history_label(entry))
+        self.fields["review"].setText(REVIEW_TEXT[verdict])
+
+    def update_review_buttons(self):
+        enabled = self.current_id is not None and self.current_id in self.entries
+        self.approve_button.setEnabled(enabled)
+        self.reject_button.setEnabled(enabled)
+
+    # ------------------------------------------------------------------ controls
+
+    def capture(self):
+        scanner.submit("capture", source="manual")
+
+    def relearn(self):
+        scanner.submit("relearn")
+
+    def pause(self, paused):
+        scanner.submit("pause", paused)
+        self.pause_button.setText("Resume  [P]" if paused else "Pause  [P]")
+
+    def auto_scan(self, on):
+        scanner.submit("auto_scan", on)
+
+    def test_image(self):
+        paths, _ = QFileDialog.getOpenFileNames(self, "Run test images through the reader", "",
+                                                "Images (*.jpg *.jpeg *.png *.bmp)")
+        for path in paths:
+            try:
+                with open(path, "rb") as f:
+                    jpeg = normalize_image(f.read(), cfg["reader"]["max_image_side"])
+            except (OSError, ValueError) as e:
+                self.append_log("Test image skipped (%s): %s" % (type(e).__name__, path.rsplit("/", 1)[-1]), "warn")
+                continue
+            scanner.submit("image", jpeg, "test")
+
+    def load_models(self):
+        worker = Worker(reader.installed_models)
+        worker.finished.connect(self.on_models)
+        self._workers.append(worker)
+        worker.start()
+
+    def on_models(self, models):
+        if isinstance(models, Exception):
+            self.append_log("Could not list AI models (is Ollama running?). Retrying in 10 s.", "warn")
+            QTimer.singleShot(10000, self.load_models)
+            models = []
+        self.model_box.clear()
+        for name in sorted(set(models) | {reader.model}):
+            self.model_box.addItem(name)
+        self.select_model(reader.model)
+
+    def select_model(self, name):
+        index = self.model_box.findText(name)
+        if index >= 0:
+            self.model_box.setCurrentIndex(index)
+
+    def change_model(self, index):
+        name = self.model_box.itemText(index)
+        if name == reader.model or self._model_job is not None:
+            return
+        self.model_box.setEnabled(False)
+        self.append_log("Switching AI model to %s (unloads the old one first)..." % name)
+        self._model_job = scanner.submit("model", name, "console")
+
+    def closeEvent(self, event):
+        self.video_timer.stop()
+        self.status_timer.stop()
+        self.pump.stop()
+        engine.stop()
+        if getattr(self, "api_server", None) is not None:
+            self.api_server.should_exit = True
+        super().closeEvent(event)
+
+
+def main():
+    app = QApplication(sys.argv)
+    app.setStyleSheet(STYLE)
+    app.setFont(QFont("Segoe UI", 10))
+    window = Console()
+    engine.start("desktop console")
+    if cfg.get("desktop", {}).get("api", True):
+        try:
+            from .main import run_api_in_thread
+            window.api_server = run_api_in_thread()
+        except Exception as e:
+            hub.log("API not started: %s" % e, "warn")
+    window.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()

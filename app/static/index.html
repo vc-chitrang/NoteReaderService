@@ -1,0 +1,234 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Note Reader Console</title>
+<style>
+  :root {
+    --bg: #0f1214; --panel: #171b1f; --line: #262c32; --text: #e6e8ea; --dim: #8b949c;
+    --info: #3ea6ff; --success: #45c46b; --warning: #f0a33a; --error: #ef5b5b; --accent: #ffd34d;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 "Segoe UI", system-ui, sans-serif; }
+  header { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 10px 16px; border-bottom: 1px solid var(--line); }
+  header h1 { font-size: 16px; margin: 0 12px 0 0; font-weight: 600; }
+  .chip { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border: 1px solid var(--line); border-radius: 99px; color: var(--dim); font-size: 12px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--dim); }
+  .dot.ok { background: var(--success); } .dot.bad { background: var(--error); } .dot.wait { background: var(--warning); }
+  main { display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr); gap: 14px; padding: 14px 16px; }
+  @media (max-width: 1100px) { main { grid-template-columns: 1fr; } }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px; min-width: 0; }
+  .panel h2 { margin: 0 0 10px; font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--dim); font-weight: 600; }
+  .video { position: relative; background: #000; border-radius: 6px; overflow: hidden; aspect-ratio: 16/9; }
+  .video img { width: 100%; height: 100%; object-fit: contain; display: block; }
+  .video .none { position: absolute; inset: 0; display: grid; place-items: center; color: var(--dim); }
+  .video .none[hidden] { display: none; }
+  .wall { margin-top: 10px; padding: 10px 12px; border-radius: 6px; border-left: 4px solid var(--dim); background: #11161a; min-height: 58px; }
+  .wall .label { font-size: 11px; color: var(--dim); text-transform: uppercase; letter-spacing: .06em; }
+  .wall .title { font-size: 17px; font-weight: 600; }
+  .wall .sub { color: var(--dim); }
+  .wall.info { border-color: var(--info); } .wall.success { border-color: var(--success); } .wall.warning { border-color: var(--warning); }
+  .controls { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; align-items: center; }
+  button, select, label.btn { background: #222a31; color: var(--text); border: 1px solid #33404b; border-radius: 6px; padding: 7px 12px; font: inherit; cursor: pointer; }
+  button:hover, label.btn:hover { background: #2a343d; }
+  button.primary { background: #1f4d7a; border-color: #2d6aa6; }
+  kbd { font-size: 11px; color: var(--dim); border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; margin-left: 4px; }
+  .meters { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; margin-top: 10px; }
+  .meter { background: #11161a; border-radius: 6px; padding: 6px 10px; }
+  .meter b { display: block; font-size: 16px; } .meter span { font-size: 11px; color: var(--dim); }
+  .result { display: grid; grid-template-columns: 180px minmax(0, 1fr); gap: 12px; }
+  .result img { width: 180px; border-radius: 6px; background: #000; min-height: 120px; object-fit: contain; }
+  .field { margin-bottom: 8px; } .field .k { font-size: 11px; color: var(--dim); text-transform: uppercase; letter-spacing: .05em; }
+  .field .v { font-size: 18px; word-break: break-word; } .field .v.empty { color: var(--error); font-size: 14px; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 12px; font-weight: 600; background: #2a3138; }
+  .badge.success { background: #1d4a2b; color: #8fe3a8; } .badge.warning { background: #4d3615; color: #ffcf8a; } .badge.error { background: #4d1b1b; color: #ffa3a3; }
+  details { margin-top: 8px; color: var(--dim); } pre { white-space: pre-wrap; word-break: break-word; margin: 6px 0 0; font: 12px/1.4 Consolas, monospace; color: var(--text); }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 5px 6px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--dim); font-weight: 500; font-size: 12px; } tr.sel { background: #1c242b; } tbody tr { cursor: pointer; }
+  .scroll { max-height: 300px; overflow: auto; }
+  #log { height: 300px; overflow: auto; font: 12px/1.5 Consolas, monospace; background: #0b0e10; border-radius: 6px; padding: 8px; }
+  #log .warn { color: var(--warning); } #log .error { color: var(--error); } #log .t { color: #5d6770; }
+  .full { grid-column: 1 / -1; }
+  .note { color: var(--dim); font-size: 12px; margin-top: 6px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Note Reader Console</h1>
+  <span class="chip"><span class="dot" id="camDot"></span><span id="camText">camera</span></span>
+  <span class="chip"><span class="dot" id="aiDot"></span><span id="aiText">AI model</span></span>
+  <select id="profile" title="AI model profile"></select>
+  <span class="chip" title="Results are only shown here until you confirm them">Unity output: off (test mode)</span>
+</header>
+
+<main>
+  <section class="panel">
+    <h2>Camera</h2>
+    <div class="video"><img id="video" src="/video" alt="Live camera"><div class="none" id="noVideo" hidden>No camera picture</div></div>
+    <div class="wall" id="wall"><div class="label">Wall would show</div><div class="title" id="wallTitle">-</div><div class="sub" id="wallSub"></div></div>
+    <div class="controls">
+      <button class="primary" id="btnCapture">Capture now<kbd>C</kbd></button>
+      <button id="btnRelearn">Relearn empty desk<kbd>R</kbd></button>
+      <button id="btnPause">Pause<kbd>P</kbd></button>
+      <label class="btn"><input type="checkbox" id="auto" checked> Auto scan</label>
+      <label class="btn">Test image(s)…<input type="file" id="upload" accept="image/*" multiple hidden></label>
+    </div>
+    <div class="meters">
+      <div class="meter"><span>State</span><b id="mState">-</b></div>
+      <div class="meter"><span>Changed area</span><b id="mFraction">-</b></div>
+      <div class="meter"><span>Motion / still</span><b id="mMotion">-</b></div>
+      <div class="meter"><span>Reads / avg</span><b id="mReads">-</b></div>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Latest read</h2>
+    <div class="result">
+      <img id="rImg" alt="">
+      <div>
+        <div class="field"><div class="k">Outcome</div><div class="v"><span class="badge" id="rOutcome">none yet</span></div></div>
+        <div class="field"><div class="k">Name</div><div class="v" id="rName">-</div></div>
+        <div class="field"><div class="k">Good deed (on the leaf)</div><div class="v" id="rMessage">-</div></div>
+        <div class="field"><div class="k">As written (before tidy)</div><div class="v" id="rBefore" style="font-size:14px">-</div></div>
+        <div class="field"><div class="k">Language · model · time</div><div class="v" id="rMeta" style="font-size:14px">-</div></div>
+      </div>
+    </div>
+    <details><summary>Timings and raw model output</summary><pre id="rRaw"></pre></details>
+    <p class="note">Check each read here. Nothing is sent to the wall (Unity) yet.</p>
+  </section>
+
+  <section class="panel">
+    <h2>History</h2>
+    <div class="scroll">
+      <table><thead><tr><th>#</th><th>Time</th><th>Source</th><th>Lang</th><th>Name</th><th>Deed</th><th>Outcome</th><th>Sec</th></tr></thead>
+      <tbody id="history"></tbody></table>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Log</h2>
+    <div id="log"></div>
+  </section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const reads = new Map();
+let selected = null, paused = false, profileSet = false;
+
+const post = (url, body) => fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
+const time = t => new Date(t * 1000).toLocaleTimeString();
+const kindOf = code => code === "accepted" ? "success" : (code === "reader_not_ready" ? "error" : "warning");
+
+function addLog(item) {
+  const line = document.createElement("div");
+  line.className = item.level;
+  const t = document.createElement("span"); t.className = "t"; t.textContent = time(item.t) + "  ";
+  line.append(t, document.createTextNode(item.text));
+  const box = $("log"), atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 20;
+  box.append(line);
+  while (box.childElementCount > 400) box.firstChild.remove();
+  if (atBottom) box.scrollTop = box.scrollHeight;
+}
+
+function showWall(message) {
+  $("wall").className = "wall " + (message && message.kind || "");
+  $("wallTitle").textContent = message ? message.title : "(nothing - wall is clean)";
+  $("wallSub").textContent = message && message.sub || "";
+}
+
+function setText(el, value) {
+  el.textContent = value || "(empty)";
+  el.classList.toggle("empty", !value);
+}
+
+function showResult(entry) {
+  selected = entry.id;
+  const r = entry.result, o = entry.outcome, t = r.timings || {};
+  $("rImg").src = "/api/captures/" + entry.id + ".jpg";
+  $("rOutcome").textContent = o.code.replace(/_/g, " ");
+  $("rOutcome").className = "badge " + kindOf(o.code);
+  setText($("rName"), r.name);
+  setText($("rMessage"), r.message);
+  $("rBefore").textContent = r.message_before_tidy && r.message_before_tidy !== r.message ? r.message_before_tidy : "(same)";
+  $("rMeta").textContent = `${r.language} · ${r.model} · ${((t.total_ms || 0) / 1000).toFixed(1)} s` + (r.ok ? "" : " · " + r.error);
+  $("rRaw").textContent = JSON.stringify({ timings: t, model_output: r.raw, readable: r.readable, outcome: o }, null, 2);
+  for (const row of $("history").children) row.classList.toggle("sel", Number(row.dataset.id) === entry.id);
+}
+
+function addHistory(entry) {
+  if (reads.has(entry.id)) return;
+  reads.set(entry.id, entry);
+  const r = entry.result, o = entry.outcome;
+  const row = document.createElement("tr");
+  row.dataset.id = entry.id;
+  const cells = [entry.id, time(entry.t), entry.source, r.language, r.name, r.message, o.code.replace(/_/g, " "),
+                 ((r.timings.total_ms || 0) / 1000).toFixed(1)];
+  for (const value of cells) { const td = document.createElement("td"); td.textContent = value || "-"; row.append(td); }
+  row.onclick = () => showResult(reads.get(entry.id));
+  $("history").prepend(row);
+}
+
+function connectEvents() {
+  const source = new EventSource("/api/events");
+  source.onmessage = e => {
+    const item = JSON.parse(e.data);
+    if (item.text) addLog(item);
+    if (item.kind === "state") showWall(item.data.message);
+    if (item.kind === "result" && !reads.has(item.data.id)) { addHistory(item.data); showResult(item.data); }
+  };
+}
+
+async function refreshStatus() {
+  try {
+    const s = await (await fetch("/api/status")).json();
+    const cam = s.camera, ai = s.reader, sc = s.scanner;
+    $("camDot").className = "dot " + (cam.ok ? "ok" : "bad");
+    $("camText").textContent = cam.ok ? `${cam.device} · ${cam.size[0]}x${cam.size[1]} · ${cam.fps} fps` : "camera not connected";
+    $("noVideo").hidden = cam.ok;
+    $("aiDot").className = "dot " + (ai.ready ? "ok" : (ai.status.startsWith("loading") ? "wait" : "bad"));
+    $("aiText").textContent = `${ai.model} · ${ai.status}`;
+    if (!profileSet) {
+      for (const [name, model] of Object.entries(ai.profiles)) $("profile").add(new Option(`${name} (${model})`, name));
+      profileSet = true;
+    }
+    $("profile").value = ai.profile;
+    $("mState").textContent = sc.state.replace(/_/g, " ");
+    $("mFraction").textContent = (sc.fraction * 100).toFixed(1) + "%";
+    $("mMotion").textContent = `${sc.motion.toFixed(3)} / ${sc.still_for}s`;
+    $("mReads").textContent = `${sc.reads} / ${(sc.avg_read_ms / 1000).toFixed(1)}s`;
+    paused = sc.paused;
+    $("btnPause").firstChild.textContent = paused ? "Resume" : "Pause";
+    $("auto").checked = sc.auto_scan;
+    if (!sc.message && !["reading", "result"].includes(sc.state)) showWall(null);
+  } catch (e) { $("aiText").textContent = "service not reachable"; $("aiDot").className = "dot bad"; }
+}
+
+async function uploadFiles(files) {
+  for (const file of files) await fetch("/api/test-image", { method: "POST", body: file });
+}
+
+$("btnCapture").onclick = () => post("/api/capture");
+$("btnRelearn").onclick = () => post("/api/relearn");
+$("btnPause").onclick = () => post("/api/pause", { paused: !paused });
+$("auto").onchange = e => post("/api/auto-scan", { enabled: e.target.checked });
+$("profile").onchange = e => post("/api/profile", { profile: e.target.value });
+$("upload").onchange = e => { uploadFiles([...e.target.files]); e.target.value = ""; };
+$("video").onerror = () => setTimeout(() => { $("video").src = "/video?" + Date.now(); }, 2000);
+document.addEventListener("keydown", e => {
+  if (e.target.tagName === "SELECT" || e.ctrlKey || e.altKey) return;
+  const key = e.key.toLowerCase();
+  if (key === "c") $("btnCapture").click();
+  if (key === "r") $("btnRelearn").click();
+  if (key === "p") $("btnPause").click();
+});
+
+fetch("/api/history").then(r => r.json()).then(items => { items.reverse().forEach(addHistory); if (items.length) showResult(items[items.length - 1]); });
+connectEvents();
+refreshStatus();
+setInterval(refreshStatus, 700);
+</script>
+</body>
+</html>

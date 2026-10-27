@@ -1,0 +1,62 @@
+"""Loads config.json from the service folder. Missing keys fall back to the defaults below."""
+import copy
+import json
+import os
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+DEFAULTS = {
+    "host": "127.0.0.1",
+    "port": 8765,
+    "open_browser": True,
+    "camera": {"name_contains": "Iriun", "index": -1, "width": 1920, "height": 1080, "fps": 30, "rotate": 0},
+    "detection": {
+        "auto_scan": True,
+        "pixel_threshold": 0.12,
+        "min_note_fraction": 0.02,
+        "max_note_fraction": 0.7,
+        "still_seconds": 1.2,
+        "still_threshold": 0.012,
+        "warmup_seconds": 2.5,
+        "result_seconds": 4.5,
+        "take_note_prompt_seconds": 14,
+    },
+    "reader": {
+        "ollama": "http://127.0.0.1:11434",
+        "profile": "fast",
+        "profiles": {"fast": {"model": "gemma3:4b"}, "accurate": {"model": "gemma3:12b"}},
+        "options": {"temperature": 0, "num_predict": 256, "num_ctx": 8192},
+        "timeout_seconds": 90,
+        "load_timeout_seconds": 600,
+        "max_image_side": 1280,
+        "tidy_english": True,
+        "english_only": False,
+    },
+    "limits": {"name_max": 24, "message_max": 100},
+    "privacy": {"keep_last_captures": 20},
+    # Desktop console: also serve the HTTP API in the background (for the wall app later).
+    "desktop": {"api": True},
+}
+
+
+def _merge(base, override):
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict) and key != "profiles":
+            _merge(base[key], value)
+        else:
+            base[key] = value
+    return base
+
+
+def load(path=None):
+    path = path or os.path.join(ROOT, "config.json")
+    cfg = copy.deepcopy(DEFAULTS)
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            _merge(cfg, json.load(f))
+    # Never listen on the network: this service handles visitors' handwriting.
+    if cfg["host"] not in ("127.0.0.1", "localhost"):
+        raise ValueError("config.json 'host' must be 127.0.0.1 (local only)")
+    if cfg["reader"]["profile"] not in cfg["reader"]["profiles"]:
+        raise ValueError("config.json reader.profile must be one of " + ", ".join(cfg["reader"]["profiles"]))
+    return cfg
