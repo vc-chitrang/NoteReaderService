@@ -1,2 +1,2 @@
-"""Good Deed Tree note reader: camera, note detection and the local AI model, with a developer console."""
+"""Good Deed Tree note scanner: camera, note detection and pen-stroke tracing (no AI), with a developer console."""
 __version__ = "0.1.0"

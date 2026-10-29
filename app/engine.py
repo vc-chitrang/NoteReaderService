@@ -1,5 +1,5 @@
 """
-The note reader engine: config, camera, AI reader and scanner, wired once and shared by every
+The note scanner engine: config, camera and scanner, wired once and shared by every
 front end (the desktop console and the HTTP API). Start it once; starting again is a no-op.
 """
 import os
@@ -12,14 +12,12 @@ from . import __version__, config
 from .camera import Camera
 from .detector import GW, GH
 from .events import EventHub
-from .reader import NoteReader
 from .scanner import Scanner
 
 cfg = config.load()
 hub = EventHub(os.path.join(config.ROOT, "logs"))
 camera = Camera(cfg["camera"], hub)
-reader = NoteReader(cfg["reader"], hub)
-scanner = Scanner(cfg, camera, reader, hub)
+scanner = Scanner(cfg, camera, hub)
 
 _started = False
 _lock = threading.Lock()
@@ -31,7 +29,7 @@ def start(front_end):
         if _started:
             return
         _started = True
-    hub.log("Note reader %s starting (%s)." % (__version__, front_end))
+    hub.log("Note scanner %s starting (%s)." % (__version__, front_end))
     camera.start()
     scanner.start()
 
@@ -51,7 +49,7 @@ def stop():
 
 STATE_COLOURS = {"idle": (160, 160, 160), "stabilizing": (0, 200, 255), "reading": (255, 160, 0),
                  "result": (80, 220, 80), "waiting_for_removal": (200, 120, 255), "paused": (90, 90, 90),
-                 "loading_model": (255, 160, 0), "no_camera": (60, 60, 220)}
+                 "no_camera": (60, 60, 220)}
 
 
 def overlay(frame, width=960):

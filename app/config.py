@@ -20,25 +20,14 @@ DEFAULTS = {
         "warmup_seconds": 2.5,
         "result_seconds": 4.5,
         "take_note_prompt_seconds": 14,
-    },
-    "reader": {
-        "ollama": "http://127.0.0.1:11434",
-        "profile": "fast",
-        "profiles": {"fast": {"model": "gemma3:4b"}, "accurate": {"model": "gemma3:12b"}},
-        "options": {"temperature": 0, "num_predict": 256, "num_ctx": 8192},
-        "timeout_seconds": 90,
-        "load_timeout_seconds": 600,
         "max_image_side": 1280,
-        "tidy_english": True,
-        "english_only": False,
     },
-    "limits": {"name_max": 24, "message_max": 100},
     "privacy": {"keep_last_captures": 20},
     # Desktop console: also serve the HTTP API in the background (for the wall app later).
     "desktop": {"api": True},
     # Handwriting mode: no reading. The note's own pen strokes are traced and sent to the wall,
     # which draws them in neon on the leaf. The wall URL must be on this PC.
-    "handwriting": {"enabled": True, "wall_url": "http://127.0.0.1:8080/api/v1/notes", "timeout_seconds": 5,
+    "handwriting": {"wall_url": "http://127.0.0.1:8080/api/v1/notes", "timeout_seconds": 5,
                     # Debug: in the desktop console, show original / black-and-white / cleaned / neon strokes
                     # and send to the wall only after Approve. Set false to send straight away.
                     "require_approval": False, "approval_timeout_seconds": 180,
@@ -68,6 +57,4 @@ def load(path=None):
         raise ValueError("config.json 'host' must be 127.0.0.1 (local only)")
     if not cfg["handwriting"]["wall_url"].startswith(("http://127.0.0.1", "http://localhost")):
         raise ValueError("config.json handwriting.wall_url must point at this PC (127.0.0.1)")
-    if cfg["reader"]["profile"] not in cfg["reader"]["profiles"]:
-        raise ValueError("config.json reader.profile must be one of " + ", ".join(cfg["reader"]["profiles"]))
     return cfg

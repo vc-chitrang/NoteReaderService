@@ -1,49 +1,40 @@
-# Good Deed Tree - Note Reader
+# Good Deed Tree - Note Scanner
 
-Reads handwritten sticky notes (`Name: ____` / `Message: ____`) from a camera with a local AI model.
-Runs fully offline on this PC: the camera, note detection, AI reading and checks all happen here.
-The wall app (Unity) will only receive the finished result. For now results stay in this console
-(test mode) until they are confirmed.
+Scans handwritten sticky notes from a camera and sends the note's pen strokes to the wall app (Unity),
+which draws them in neon on the leaf. **No AI is used**: the strokes come from plain image processing
+(black and white, clean-up, thinning, tracing). Everything runs offline on this PC.
 
 ## Use
-1. One time: double-click `install.bat` (creates `.venv`, installs packages, checks the models).
-2. Every time: double-click `start.bat`. It starts Ollama if needed and opens the **Note Reader**
-   desktop console. Close the console window to stop it.
+1. One time: double-click `install.bat` (creates `.venv` and installs the Python packages).
+2. Every time: double-click `start.bat`. It opens the **Note Scanner** desktop console.
+   Close the console window to stop it.
 3. Keep the desk empty at start (the empty desk is learned after ~2.5 s), or press **R** later.
+4. Start the wall app (Unity). Notes go to `http://127.0.0.1:8080/api/v1/notes` on this PC.
 
-This service owns the camera and all note reading. The wall app (Unity) has no camera or AI code;
-it will only receive finished results. For now results stay in this console (play-test mode).
+## How a note is handled
+- A note placed on the desk and held still is traced and sent to the wall automatically.
+- A different note placed over the previous one is detected and sent too.
+- The same note again (even moved a little) is recognised from its ink and not sent twice
+  (`handwriting.duplicate_seconds`, default 90 s).
+- Tick **Review before sending** in the console to see original / black and white / cleaned / strokes
+  and approve each note first (**A** approve, **X** reject in the review window).
 
 ## Console (desktop, PySide6)
-- Live camera with the detected note box, a scan line while reading, and the scan state.
-- "Wall would show": the exact message the wall would display (or nothing).
-- Controls: **C** capture now, **R** relearn empty desk, **P** pause, auto scan on/off,
-  **Test image...** (runs saved photos through the same path), AI model dropdown (all installed
-  Ollama models; switching unloads the old one from GPU memory first).
-- Read card: cropped photo, the wall sentence, name, deed (after the tidy and as written),
-  language, outcome, timings, model and the raw model answer.
-- Play test: **A** approve / **X** reject each read. Nothing is sent to the wall yet.
-- History of the last 50 reads and the live log.
-
-Browser console (old, optional): `.venv\Scripts\python -m app.main` -> http://127.0.0.1:8765/
+- Live camera with the detected note box, the scan state and "Wall would show" feedback.
+- Controls: **C** capture now, **R** relearn empty desk, **P** pause, Auto scan, Review before sending,
+  **Test image...** (runs saved photos through the same path).
+- Last note card, history of the last 50 notes (memory only) and the live log.
 
 ## Settings (`config.json`, restart to apply)
 - `camera.name_contains` (default `Iriun`), or `camera.index`; `camera.rotate` 0/90/180/270.
-- `detection.*`: same tuning as the wall app (threshold, note size, still time).
-- `reader.profiles`: `fast` = gemma3:4b, `accurate` = gemma3:12b. Switch in the console;
-  the old model is unloaded from GPU memory first.
-- `reader.english_only`, `limits.name_max` / `message_max`.
+- `detection.*`: threshold, note size, how long a note must be still.
+- `handwriting.wall_url` (must be on this PC), `require_approval`, `duplicate_seconds`,
+  `watch_for_new_note`, `new_note_change`.
 
-## API (for the wall app)
-- `GET /health` -> `{status, camera, model, model_loaded}`
-- `POST /v1/tasks/sticky-note` with the image bytes as the body -> `{ok, id, result, outcome}`.
-  `outcome.code`: `accepted`, `missing_name`, `missing_message`, `unreadable`,
-  `unsupported_language`, `reader_not_ready`. `outcome.title`/`sub` are the wall messages.
-  One read at a time; 429 `busy` if more than 3 are waiting.
-
-## Accuracy check
-`.venv\Scripts\python -m tests.benchmark [--profile accurate] [--samples tests\indic_samples]`
+## Local API (127.0.0.1:8765, optional)
+`GET /health`, `GET /api/status`, `POST /api/capture|relearn|pause|auto-scan|review`, and
+`POST /v1/tasks/sticky-note` (image bytes in, `{aspect, strokes}` out; sends nothing).
 
 ## Privacy
-Listens on 127.0.0.1 only. Photos are kept in memory (last 20, for the console) and never
-written to disk. `logs/service.log` has timings and yes/no flags only, never names or messages.
+Listens on 127.0.0.1 only. Photos are kept in memory (last 20, for the console) and never written to
+disk. `logs/service.log` has timings and counts only, never names or messages.

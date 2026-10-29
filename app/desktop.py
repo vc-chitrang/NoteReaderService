@@ -1,5 +1,5 @@
 """
-Desktop developer console for the note reader (PySide6).
+Desktop developer console for the note scanner (PySide6).
 
     .venv\\Scripts\\python -m app.desktop        (or double-click start.bat)
 
@@ -24,7 +24,7 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QFil
 from . import __version__, engine
 from .detector import normalize_image
 
-cfg, hub, camera, reader, scanner = engine.cfg, engine.hub, engine.camera, engine.reader, engine.scanner
+cfg, hub, camera, scanner = engine.cfg, engine.hub, engine.camera, engine.scanner
 
 KIND_COLOURS = {"info": "#ffe829", "success": "#a0eb96", "warning": "#ffaa5a", None: "#9aa0a6"}
 REVIEW_TEXT = {None: "not reviewed", "approved": "approved — would send to wall", "rejected": "rejected"}
@@ -176,10 +176,8 @@ class Console(QMainWindow):
         self.setWindowTitle("Good Deed Tree — Note Reader %s (developer console)" % __version__)
         self.resize(1600, 960)
         self.entries = {}         # capture id -> history entry (memory only)
-        self.reviews = {}         # capture id -> "approved" / "rejected"
         self.current_id = None
         self._workers = []
-        self._model_job = None
 
         root = QSplitter(Qt.Horizontal)
         root.addWidget(self._build_left())
@@ -191,8 +189,6 @@ class Console(QMainWindow):
         QShortcut(QKeySequence("C"), self, activated=self.capture)
         QShortcut(QKeySequence("R"), self, activated=self.relearn)
         QShortcut(QKeySequence("P"), self, activated=lambda: self.pause_button.toggle())
-        QShortcut(QKeySequence("A"), self, activated=lambda: self.review("approved"))
-        QShortcut(QKeySequence("X"), self, activated=lambda: self.review("rejected"))
 
         self.video_timer = QTimer(self, interval=66, timeout=self.update_video)       # ~15 fps preview
         self.status_timer = QTimer(self, interval=1000, timeout=self.update_status)
@@ -202,8 +198,6 @@ class Console(QMainWindow):
         self.pump = EventPump()
         self.pump.events.connect(self.on_events)
         self.pump.start()
-        self.load_models()
-        self.update_review_buttons()
 
     # ------------------------------------------------------------------ layout
 
@@ -229,16 +223,11 @@ class Console(QMainWindow):
         self.pause_button = QPushButton("Pause  [P]", checkable=True, toggled=self.pause)
         self.auto_box = QCheckBox("Auto scan", checked=scanner.auto_scan, toggled=self.auto_scan)
         self.review_box = QCheckBox("Review before sending", checked=scanner.cfg["handwriting"]["require_approval"],
-                                    toggled=self.review)
+                                    toggled=self.set_review_mode)
         self.test_button = QPushButton("Test image…", clicked=self.test_image)
         for w in (self.capture_button, self.relearn_button, self.pause_button, self.auto_box, self.review_box, self.test_button):
             controls.addWidget(w)
         controls.addStretch(1)
-        controls.addWidget(QLabel("AI model"))
-        self.model_box = QComboBox()
-        self.model_box.setMinimumWidth(170)
-        self.model_box.activated.connect(self.change_model)
-        controls.addWidget(self.model_box)
         layout.addLayout(controls)
 
         self.status_line = QLabel()
@@ -250,9 +239,9 @@ class Console(QMainWindow):
         panel = QWidget()
         layout = QVBoxLayout(panel)
 
-        card = QGroupBox("Read")
+        card = QGroupBox("Last note")
         card_layout = QHBoxLayout(card)
-        self.crop = QLabel("No read yet")
+        self.crop = QLabel("No note yet")
         self.crop.setAlignment(Qt.AlignCenter)
         self.crop.setFixedSize(260, 260)
         self.crop.setStyleSheet("background:#0d0f12; border-radius:4px; color:#5c636d;")
@@ -260,34 +249,20 @@ class Console(QMainWindow):
 
         form = QFormLayout()
         self.fields = {}
-        for key, label in (("sentence", "Wall leaf"), ("name", "Name"), ("message", "Deed"),
-                           ("as_written", "As written"), ("language", "Language"), ("outcome", "Outcome"),
-                           ("timings", "Timings"), ("model", "Model"), ("review", "Play test")):
+        for key, label in (("outcome", "Outcome"), ("timings", "Timings")):
             value = QLabel("—")
             value.setWordWrap(True)
             value.setTextInteractionFlags(Qt.TextSelectableByMouse)
-            if key in ("sentence", "name", "message"):
-                value.setObjectName("field")
             form.addRow(QLabel(label), value)
             self.fields[key] = value
         right = QVBoxLayout()
         right.addLayout(form)
-        buttons = QHBoxLayout()
-        self.approve_button = QPushButton("Approve  [A]", objectName="approve", clicked=lambda: self.review("approved"))
-        self.reject_button = QPushButton("Reject  [X]", objectName="reject", clicked=lambda: self.review("rejected"))
-        buttons.addWidget(self.approve_button)
-        buttons.addWidget(self.reject_button)
-        right.addLayout(buttons)
-        hint = QLabel("Play-test mode: results are not sent to the wall app.")
+        hint = QLabel("Notes are sent to the wall automatically. Tick \"Review before sending\" to check each one first.")
         hint.setObjectName("muted")
+        hint.setWordWrap(True)
         right.addWidget(hint)
         card_layout.addLayout(right, 1)
         layout.addWidget(card)
-
-        self.raw = QPlainTextEdit(readOnly=True)
-        self.raw.setPlaceholderText("Raw model answer")
-        self.raw.setMaximumHeight(110)
-        layout.addWidget(self.raw)
 
         lower = QSplitter(Qt.Vertical)
         history_box = QGroupBox("History (this session, memory only)")
@@ -322,16 +297,8 @@ class Console(QMainWindow):
         s = scanner.status()
         cam = "%s %dx%d" % (camera.device_name, camera.size[0], camera.size[1]) if camera.ok else "no camera"
         self.status_line.setText(
-            "Camera: %s   |   AI: %s (%s)   |   State: %s   |   Reads: %d, avg %.1f s   |   Queue: %d" % (
-                cam, reader.model, reader.status, s["state"].replace("_", " "), s["reads"],
-                s["avg_read_ms"] / 1000.0, s["queue"]))
-        if self._model_job is not None and self._model_job.done.is_set():
-            result = self._model_job.result or {}
-            self._model_job = None
-            self.model_box.setEnabled(True)
-            self.select_model(reader.model)
-            if not result.get("ok"):
-                self.append_log("Model switch did not finish: %s" % result.get("status", "unknown"), "warn")
+            "Camera: %s   |   State: %s   |   Notes: %d, avg %.1f s   |   Queue: %d" % (
+                cam, s["state"].replace("_", " "), s["reads"], s["avg_read_ms"] / 1000.0, s["queue"]))
 
     def set_banner(self, message):
         if not message:
@@ -393,11 +360,8 @@ class Console(QMainWindow):
             QApplication.alert(self)
 
     def history_label(self, entry):
-        r, o = entry["result"], entry["outcome"]
-        who = o.get("name") or r.get("name") or "?"
-        return "#%d  %s  %-8s  %-20s  %s  [%s]" % (
-            entry["id"], time.strftime("%H:%M:%S", time.localtime(entry["t"])), entry["source"],
-            o["code"], who, self.reviews.get(entry["id"], "-"))
+        return "#%d  %s  %-11s  %s" % (
+            entry["id"], time.strftime("%H:%M:%S", time.localtime(entry["t"])), entry["source"], entry["outcome"]["code"])
 
     def on_history_selected(self, item, _previous=None):
         if item is None:
@@ -417,49 +381,8 @@ class Console(QMainWindow):
         else:
             self.crop.setText("(photo no longer kept)")
         f = self.fields
-        f["sentence"].setText(self.wall_sentence(o) if o["code"] == "accepted" else "— (no leaf)")
-        f["name"].setText(r.get("name") or "—")
-        f["message"].setText(r.get("message") or "—")
-        f["as_written"].setText(r.get("message_before_tidy") or "—")
-        f["language"].setText(r.get("language", "?"))
-        f["outcome"].setText("%s — %s" % (o["code"], o["title"]) + ("" if r.get("ok") else "  (error: %s)" % r.get("error")))
-        t = r.get("timings", {})
-        f["timings"].setText("total %.1f s  ·  model %.1f s  ·  tidy %.1f s  ·  load %.1f s" % (
-            t.get("total_ms", 0) / 1000, t.get("model_ms", 0) / 1000, t.get("tidy_ms", 0) / 1000, t.get("load_ms", 0) / 1000))
-        f["model"].setText(r.get("model", "?"))
-        f["review"].setText(REVIEW_TEXT[self.reviews.get(entry["id"])])
-        self.raw.setPlainText(json.dumps(r.get("raw"), ensure_ascii=False, indent=1) if r.get("raw") else "")
-        self.update_review_buttons()
-
-    @staticmethod
-    def wall_sentence(outcome):
-        # Same wording as the wall (DeedSentence): "Name chose to <deed>." for English.
-        name, message = outcome.get("name", ""), outcome.get("message", "")
-        if outcome.get("language") == "en":
-            deed = message[:1].lower() + message[1:] if message[1:2].islower() else message
-            return "<b>%s</b> chose to %s." % (name, deed.rstrip(".!?"))
-        return "<b>%s</b>: %s" % (name, message)
-
-    # ------------------------------------------------------------------ play test
-
-    def review(self, verdict):
-        if self.current_id is None or self.current_id not in self.entries:
-            return
-        self.reviews[self.current_id] = verdict
-        entry = self.entries[self.current_id]
-        # Log line on disk: outcome and verdict only, never the visitor's words.
-        hub.log("Play test: read #%d (%s, %s) %s." % (entry["id"], entry["outcome"]["code"],
-                                                      entry["result"].get("model", "?"), verdict))
-        for i in range(self.history.count()):
-            item = self.history.item(i)
-            if item.data(Qt.UserRole) == entry["id"]:
-                item.setText(self.history_label(entry))
-        self.fields["review"].setText(REVIEW_TEXT[verdict])
-
-    def update_review_buttons(self):
-        enabled = self.current_id is not None and self.current_id in self.entries
-        self.approve_button.setEnabled(enabled)
-        self.reject_button.setEnabled(enabled)
+        f["outcome"].setText("%s — %s" % (o["code"], o["title"]) + ("" if r.get("ok") else "  (%s)" % r.get("error")))
+        f["timings"].setText("total %.1f s" % (r.get("timings", {}).get("total_ms", 0) / 1000))
 
     # ------------------------------------------------------------------ controls
 
@@ -476,49 +399,20 @@ class Console(QMainWindow):
     def auto_scan(self, on):
         scanner.submit("auto_scan", on)
 
-    def review(self, on):
+    def set_review_mode(self, on):
         scanner.submit("approval", on)
 
     def test_image(self):
-        paths, _ = QFileDialog.getOpenFileNames(self, "Run test images through the reader", "",
+        paths, _ = QFileDialog.getOpenFileNames(self, "Run test images through the scanner", "",
                                                 "Images (*.jpg *.jpeg *.png *.bmp)")
         for path in paths:
             try:
                 with open(path, "rb") as f:
-                    jpeg = normalize_image(f.read(), cfg["reader"]["max_image_side"])
+                    jpeg = normalize_image(f.read(), cfg["detection"]["max_image_side"])
             except (OSError, ValueError) as e:
                 self.append_log("Test image skipped (%s): %s" % (type(e).__name__, path.rsplit("/", 1)[-1]), "warn")
                 continue
             scanner.submit("image", jpeg, "test")
-
-    def load_models(self):
-        worker = Worker(reader.installed_models)
-        worker.finished.connect(self.on_models)
-        self._workers.append(worker)
-        worker.start()
-
-    def on_models(self, models):
-        if isinstance(models, Exception):
-            self.append_log("Could not list AI models (is Ollama running?). Retrying in 10 s.", "warn")
-            QTimer.singleShot(10000, self.load_models)
-            models = []
-        self.model_box.clear()
-        for name in sorted(set(models) | {reader.model}):
-            self.model_box.addItem(name)
-        self.select_model(reader.model)
-
-    def select_model(self, name):
-        index = self.model_box.findText(name)
-        if index >= 0:
-            self.model_box.setCurrentIndex(index)
-
-    def change_model(self, index):
-        name = self.model_box.itemText(index)
-        if name == reader.model or self._model_job is not None:
-            return
-        self.model_box.setEnabled(False)
-        self.append_log("Switching AI model to %s (unloads the old one first)..." % name)
-        self._model_job = scanner.submit("model", name, "console")
 
     def closeEvent(self, event):
         self.video_timer.stop()

@@ -1,8 +1,8 @@
 """
 The scanning loop (one worker thread). Watches the camera, waits for a note to be placed and held
-still, crops it, reads it with the AI, decides the outcome, and publishes every step to the console.
-Manual captures, uploaded test images and API requests are queued to the same worker, so only one
-note is ever read at a time (the GPU is shared with the wall scene).
+still, crops it, traces its pen strokes (plain image processing, no AI) and sends them to the wall, and
+publishes every step to the console. Manual captures, uploaded test images and API requests are queued
+to the same worker, so only one note is processed at a time.
 """
 import collections
 import json
@@ -14,7 +14,6 @@ import uuid
 
 import cv2
 
-from . import outcome as outcomes
 from . import strokes
 from .detector import Detector
 
@@ -31,11 +30,10 @@ class Job:
 
 
 class Scanner:
-    def __init__(self, cfg, camera, reader, hub):
+    def __init__(self, cfg, camera, hub):
         self.cfg = cfg
         self.det_cfg = cfg["detection"]
         self.camera = camera
-        self.reader = reader
         self.hub = hub
         self.detector = Detector(self.det_cfg)
 
@@ -69,8 +67,6 @@ class Scanner:
         self._last_frame_id = -1
         self._result_until = 0.0
         self._after_result = "idle"
-        self._preparing = threading.Lock()
-        self._next_prepare = 0.0
 
     # ------------------------------------------------------------------ public (any thread)
 
@@ -108,25 +104,9 @@ class Scanner:
 
     # ------------------------------------------------------------------ worker
 
-    def _prepare_reader_async(self):
-        """Loads the model in the background; retried every 10 s while Ollama is down."""
-        self._next_prepare = time.time() + 10.0
-        if self._preparing.acquire(blocking=False):
-            def work():
-                try:
-                    self.reader.prepare()
-                finally:
-                    self._preparing.release()
-            threading.Thread(target=work, name="reader-prepare", daemon=True).start()
-
     def _run(self):
-        handwriting = self.cfg["handwriting"]["enabled"]
-        if not handwriting:      # handwriting mode never loads the AI model (it shares the GPU with the wall)
-            self._prepare_reader_async()
         self._enter("starting")
         while not self._stop.is_set():
-            if not handwriting and not self.reader.ready and time.time() >= self._next_prepare:
-                self._prepare_reader_async()
             try:
                 job = self._jobs.get(timeout=TICK)
             except queue.Empty:
@@ -155,7 +135,7 @@ class Scanner:
                 if self.detector.has_reference:
                     self.detector.update(Detector.sample(frame))
                 self.hub.log("Manual capture (%s)." % ("note box" if self.detector.bbox else "whole view"))
-                jpeg = self.detector.crop_jpeg(frame, self.cfg["reader"]["max_image_side"])
+                jpeg = self.detector.crop_jpeg(frame, self.det_cfg["max_image_side"])
                 self._eval_sig = self._signature(frame)
                 job.result = self._read(jpeg, "manual")
                 self._after_result = "waiting_for_removal"
@@ -175,16 +155,6 @@ class Scanner:
         elif job.kind == "auto_scan":
             self.auto_scan = bool(job.payload)
             self.hub.log("Auto scan %s." % ("on" if self.auto_scan else "off (manual capture only)"))
-        elif job.kind == "model":
-            job.kind, job.payload = "profile", self.reader.profile_for(job.payload)
-            self._handle(job)
-            return
-        elif job.kind == "profile":
-            self._enter("loading_model", "info", "Loading the AI model...", self.reader.cfg["profiles"][job.payload]["model"])
-            with self._preparing:
-                ok = self.reader.set_profile(job.payload)
-            job.result = {"ok": ok, "profile": self.reader.profile, "model": self.reader.model, "status": self.reader.status}
-            self._enter("idle")
         job.done.set()
 
     def _tick(self):
@@ -252,7 +222,7 @@ class Scanner:
                 self._cut_off_shown = False
                 self._show("info", "I can see your note", "Hold it still for a moment")
             if self._still_for >= c["still_seconds"]:
-                jpeg = self.detector.crop_jpeg(frame, self.cfg["reader"]["max_image_side"])
+                jpeg = self.detector.crop_jpeg(frame, self.det_cfg["max_image_side"])
                 self._eval_sig = self._signature(frame)
                 self._read(jpeg, "camera")
                 self._after_result = "waiting_for_removal"
@@ -273,7 +243,7 @@ class Scanner:
         """A different note placed over (or instead of) the last one is read and sent too, without waiting for
         the desk to be emptied. The same note again is recognised by its ink and not sent twice."""
         hw = self.cfg["handwriting"]
-        if not (hw["enabled"] and hw.get("watch_for_new_note", True) and self.auto_scan and note_like):
+        if not (hw.get("watch_for_new_note", True) and self.auto_scan and note_like):
             self._new_still = 0.0
             return
         c = self.det_cfg
@@ -291,7 +261,7 @@ class Scanner:
             self._last_eval = time.time()
             self._eval_sig = signature
             self.hub.log("A different note is on the desk; checking it.")
-            jpeg = self.detector.crop_jpeg(frame, self.cfg["reader"]["max_image_side"])
+            jpeg = self.detector.crop_jpeg(frame, self.det_cfg["max_image_side"])
             self._read(jpeg, "camera-new")
             self._after_result = "waiting_for_removal"
 
@@ -308,36 +278,7 @@ class Scanner:
     # ------------------------------------------------------------------ reading
 
     def _read(self, jpeg, source):
-        if self.cfg["handwriting"]["enabled"]:
-            return self._handwriting(jpeg, source)
-        capture_id = self._store_capture(jpeg)
-        self._enter("reading", "info", "Reading your note...", "This takes a few seconds")
-        self.hub.emit("capture", data={"capture_id": capture_id, "source": source, "bytes": len(jpeg)})
-
-        if not self.reader.ready:
-            with self._preparing:     # Ollama may have been started after this service
-                if not self.reader.ready:
-                    self.reader.prepare()
-        result = self.reader.read(jpeg)
-        decision = outcomes.evaluate(result, self.cfg["limits"], self.cfg["reader"].get("english_only", False))
-
-        self.reads += 1
-        self.total_read_ms += result["timings"].get("total_ms", 0)
-        entry = {"id": capture_id, "t": time.time(), "source": source, "result": result, "outcome": decision}
-        self.history.appendleft(entry)
-
-        # Log line on disk: timing and flags only, never the visitor's words.
-        t = result["timings"]
-        self.hub.emit("result", level="info" if result["ok"] else "warn", data=entry, text=(
-            "Read #%d (%s) in %.1f s [model %.1f s, tidy %.1f s, load %.1f s]: ok=%s lang=%s name=%s deed=%s -> %s%s" % (
-                capture_id, source, t.get("total_ms", 0) / 1000, t.get("model_ms", 0) / 1000,
-                t.get("tidy_ms", 0) / 1000, t.get("load_ms", 0) / 1000, result["ok"], result["language"],
-                "yes" if result["name"] else "no", "yes" if result["message"] else "no", decision["code"],
-                "" if result["ok"] else " error=" + result["error"])))
-
-        self._enter("result", decision["kind"], decision["title"], decision["sub"])
-        self._result_until = time.time() + self.det_cfg["result_seconds"]
-        return entry
+        return self._handwriting(jpeg, source)
 
     def decide(self, capture_id, approved):
         """Called by the console when Approve / Reject is pressed for a traced note."""
