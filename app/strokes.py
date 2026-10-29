@@ -682,3 +682,49 @@ def render_overlay(result, clean, width=900):
         colour = (255, 230, 90) if s.get("g", 0) == 1 else (50, 220, 255)
         cv2.polylines(canvas, [pts], False, colour, 2, cv2.LINE_AA)
     return canvas
+
+
+# ---------------------------------------------------------------------- is it the same note again?
+
+FP_W, FP_H = 160, 120
+
+
+def fingerprint(clean):
+    """A small picture of the note's ink, independent of where on the desk the note lies: the ink is cropped to
+    its own bounding box and shrunk to a fixed size. Used only to tell whether a note was already sent."""
+    ys, xs = np.nonzero(clean > 0)
+    if len(xs) < 20:
+        return None
+    crop = (clean[ys.min():ys.max() + 1, xs.min():xs.max() + 1] > 0).astype(np.uint8) * 255
+    small = cv2.resize(crop, (FP_W, FP_H), interpolation=cv2.INTER_AREA)
+    return (small > 40).astype(np.uint8)
+
+
+def _band_score(a, b, k, bands):
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    da, db = cv2.dilate(a, kernel), cv2.dilate(b, kernel)
+    worst = 1.0
+    h = a.shape[0]
+    for i in range(bands):
+        s = slice(i * h // bands, (i + 1) * h // bands)
+        sa, sb = float(a[s].sum()), float(b[s].sum())
+        if sa < 15 and sb < 15:
+            continue            # nothing written in this band on either note
+        ra = float((a[s] & db[s]).sum()) / max(1.0, sa)
+        rb = float((b[s] & da[s]).sum()) / max(1.0, sb)
+        worst = min(worst, ra, rb)
+    return worst
+
+
+def same_note(a, b, threshold=0.92):
+    """True when two fingerprints show the same writing. The note is compared in horizontal bands and the WORST band
+    decides, so two notes that share a name but differ in the deed are not mistaken for each other, while a note that
+    was lifted and put back (moved a little, slightly tilted, pen a little thicker) still matches."""
+    if a is None or b is None:
+        return False
+    best = 0.0
+    for dy in (-3, 0, 3):
+        for dx in (-3, 0, 3):
+            shifted = np.roll(np.roll(b, dy, axis=0), dx, axis=1)
+            best = max(best, _band_score(a, shifted, 5, 4))
+    return best >= threshold

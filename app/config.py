@@ -41,7 +41,10 @@ DEFAULTS = {
     "handwriting": {"enabled": True, "wall_url": "http://127.0.0.1:8080/api/v1/notes", "timeout_seconds": 5,
                     # Debug: in the desktop console, show original / black-and-white / cleaned / neon strokes
                     # and send to the wall only after Approve. Set false to send straight away.
-                    "require_approval": True, "approval_timeout_seconds": 180},
+                    "require_approval": False, "approval_timeout_seconds": 180,
+                    # Automatic mode: a note is traced and sent as soon as it is placed and held still; a different
+                    # note placed over it is sent too. A note already sent in the last duplicate_seconds is not sent again.
+                    "duplicate_seconds": 90, "watch_for_new_note": True, "new_note_change": 0.012},
 }
 
 

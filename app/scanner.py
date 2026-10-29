@@ -47,6 +47,10 @@ class Scanner:
         self.previews = collections.OrderedDict()    # id -> {stage: PNG bytes} for the approval window, memory only
         self.approval_ui = False                     # the desktop console sets this: it will show the approval window
         self._decisions = {}                         # id -> [threading.Event, approved]
+        self._sent = collections.deque(maxlen=10)    # (fingerprint, time) of notes already sent: no duplicates
+        self._eval_sig = None                        # the picture when the last note was read (to spot a new note)
+        self._new_still = 0.0
+        self._last_eval = 0.0
         self.history = collections.deque(maxlen=50)
         self.reads = 0
         self.total_read_ms = 0
@@ -152,6 +156,7 @@ class Scanner:
                     self.detector.update(Detector.sample(frame))
                 self.hub.log("Manual capture (%s)." % ("note box" if self.detector.bbox else "whole view"))
                 jpeg = self.detector.crop_jpeg(frame, self.cfg["reader"]["max_image_side"])
+                self._eval_sig = self._signature(frame)
                 job.result = self._read(jpeg, "manual")
                 self._after_result = "waiting_for_removal"
         elif job.kind == "relearn":
@@ -164,6 +169,9 @@ class Scanner:
             self.paused = bool(job.payload)
             self.hub.log("Scanning paused." if self.paused else "Scanning resumed.")
             self._enter("paused" if self.paused else "idle")
+        elif job.kind == "approval":
+            self.cfg["handwriting"]["require_approval"] = bool(job.payload)
+            self.hub.log("Review before sending %s." % ("on" if job.payload else "off (notes are sent automatically)"))
         elif job.kind == "auto_scan":
             self.auto_scan = bool(job.payload)
             self.hub.log("Auto scan %s." % ("on" if self.auto_scan else "off (manual capture only)"))
@@ -245,6 +253,7 @@ class Scanner:
                 self._show("info", "I can see your note", "Hold it still for a moment")
             if self._still_for >= c["still_seconds"]:
                 jpeg = self.detector.crop_jpeg(frame, self.cfg["reader"]["max_image_side"])
+                self._eval_sig = self._signature(frame)
                 self._read(jpeg, "camera")
                 self._after_result = "waiting_for_removal"
 
@@ -255,9 +264,46 @@ class Scanner:
                     self._enter("idle")
             else:
                 self._empty_for = 0.0
+                self._watch_for_new_note(frame, small, note_like, motion)
                 if not self._take_prompt_shown and time.time() - self._state_since > c["take_note_prompt_seconds"]:
                     self._take_prompt_shown = True
                     self._show("info", "Please take your note", "so the next person can add theirs")
+
+    def _watch_for_new_note(self, frame, small, note_like, motion):
+        """A different note placed over (or instead of) the last one is read and sent too, without waiting for
+        the desk to be emptied. The same note again is recognised by its ink and not sent twice."""
+        hw = self.cfg["handwriting"]
+        if not (hw["enabled"] and hw.get("watch_for_new_note", True) and self.auto_scan and note_like):
+            self._new_still = 0.0
+            return
+        c = self.det_cfg
+        if self._eval_sig is None or time.time() - self._last_eval < 2.0:
+            return
+        # Compare at a size where handwriting is visible (the 64x36 desk grid is too coarse to see a changed word).
+        signature = self._signature(frame)
+        changed = float((abs(signature - self._eval_sig) > 45.0).mean()) > hw.get("new_note_change", 0.012)
+        if not changed or motion >= c["still_threshold"] or self.detector.touches_edge():
+            self._new_still = 0.0
+            return
+        self._new_still += TICK
+        if self._new_still >= c["still_seconds"]:
+            self._new_still = 0.0
+            self._last_eval = time.time()
+            self._eval_sig = signature
+            self.hub.log("A different note is on the desk; checking it.")
+            jpeg = self.detector.crop_jpeg(frame, self.cfg["reader"]["max_image_side"])
+            self._read(jpeg, "camera-new")
+            self._after_result = "waiting_for_removal"
+
+    @staticmethod
+    def _signature(frame):
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        return cv2.GaussianBlur(cv2.resize(gray, (320, 180), interpolation=cv2.INTER_AREA), (5, 5), 0).astype("float32")
+
+    def _is_duplicate(self, fingerprint):
+        window = self.cfg["handwriting"].get("duplicate_seconds", 90)
+        now = time.time()
+        return any(now - t <= window and strokes.same_note(fp, fingerprint) for fp, t in self._sent)
 
     # ------------------------------------------------------------------ reading
 
@@ -345,12 +391,18 @@ class Scanner:
             if stroke_count == 0:
                 decision.update(code="unreadable", title="We couldn't see any writing",
                                 sub="Please write a little bigger and darker, then place it again")
+            elif self._is_duplicate(strokes.fingerprint(traced["stages"]["clean"])):
+                decision.update(code="duplicate", kind="info", title="This note was already sent",
+                                sub="Place a new note when you are ready")
             elif not self._await_approval(capture_id, traced):
                 decision.update(code="not_approved", title="Note not sent",
                                 sub="Please place it again if you want to try once more")
             else:
                 reply = self._send_to_wall(traced)
                 if reply.get("status") == "accepted":
+                    fp = strokes.fingerprint(traced["stages"]["clean"])
+                    if fp is not None:
+                        self._sent.append((fp, time.time()))
                     decision.update(code="accepted", kind="success", title="Thank you!",
                                     sub="Your leaf is on its way to the tree")
                 else:

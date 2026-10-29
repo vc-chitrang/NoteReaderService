@@ -228,8 +228,10 @@ class Console(QMainWindow):
         self.relearn_button = QPushButton("Relearn desk  [R]", clicked=self.relearn)
         self.pause_button = QPushButton("Pause  [P]", checkable=True, toggled=self.pause)
         self.auto_box = QCheckBox("Auto scan", checked=scanner.auto_scan, toggled=self.auto_scan)
+        self.review_box = QCheckBox("Review before sending", checked=scanner.cfg["handwriting"]["require_approval"],
+                                    toggled=self.review)
         self.test_button = QPushButton("Test image…", clicked=self.test_image)
-        for w in (self.capture_button, self.relearn_button, self.pause_button, self.auto_box, self.test_button):
+        for w in (self.capture_button, self.relearn_button, self.pause_button, self.auto_box, self.review_box, self.test_button):
             controls.addWidget(w)
         controls.addStretch(1)
         controls.addWidget(QLabel("AI model"))
@@ -473,6 +475,9 @@ class Console(QMainWindow):
 
     def auto_scan(self, on):
         scanner.submit("auto_scan", on)
+
+    def review(self, on):
+        scanner.submit("approval", on)
 
     def test_image(self):
         paths, _ = QFileDialog.getOpenFileNames(self, "Run test images through the reader", "",
