@@ -17,7 +17,7 @@ import time
 
 from PySide6.QtCore import QObject, QThread, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QImage, QKeySequence, QPixmap, QShortcut, QTextCursor
-from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QFileDialog, QFormLayout, QFrame,
+from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout, QFrame,
                                QGroupBox, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMainWindow,
                                QPlainTextEdit, QPushButton, QSizePolicy, QSplitter, QVBoxLayout, QWidget)
 
@@ -94,6 +94,78 @@ def to_pixmap(frame_bgr):
     h, w = frame_bgr.shape[:2]
     image = QImage(frame_bgr.data, w, h, frame_bgr.strides[0], QImage.Format_BGR888)
     return QPixmap.fromImage(image.copy())
+
+
+# ---------------------------------------------------------------------- approval window
+
+class ApprovalDialog(QDialog):
+    """Debug gate for a traced note: original, black and white, cleaned, final neon strokes, side by side.
+    Nothing goes to the wall until Approve is pressed."""
+
+    def __init__(self, parent, capture_id, original_jpeg, stages, decide):
+        super().__init__(parent)
+        self.capture_id = capture_id
+        self._decide = decide
+        self._decided = False
+        self.setWindowTitle("Check the note #%d before it goes to the wall" % capture_id)
+        screen = QApplication.primaryScreen().availableGeometry()
+        panel_w = max(260, min(430, (screen.width() - 120) // 4))
+
+        layout = QVBoxLayout(self)
+        row = QHBoxLayout()
+        panels = [("Original photo", original_jpeg), ("1 · Black and white", stages["bw"]),
+                  ("2 · Cleaned: holes filled, ruled lines removed", stages["clean"]),
+                  ("3 · Strokes sent to the wall, over the cleaned image (name cyan, message yellow)", stages["final"])]
+        for title, data in panels:
+            box = QVBoxLayout()
+            caption = QLabel(title)
+            caption.setObjectName("muted")
+            caption.setWordWrap(True)
+            image = QLabel()
+            image.setStyleSheet("background: #000;")
+            pixmap = QPixmap()
+            if data:
+                pixmap.loadFromData(data)
+                scaled = pixmap.scaledToWidth(panel_w, Qt.SmoothTransformation)
+                image.setPixmap(scaled)
+                image.setFixedSize(scaled.size())
+            else:
+                image.setText("(not kept)")
+            image.setAlignment(Qt.AlignTop | Qt.AlignHCenter)
+            box.addWidget(caption)
+            box.addWidget(image, 0, Qt.AlignHCenter)
+            box.addStretch(1)
+            row.addLayout(box, 1)
+        layout.addLayout(row, 1)
+
+        buttons = QHBoxLayout()
+        self.approve_button = QPushButton("Approve — send to the wall  (A)")
+        self.approve_button.setObjectName("approve")
+        self.reject_button = QPushButton("Reject — do not send  (X)")
+        self.reject_button.setObjectName("reject")
+        self.approve_button.clicked.connect(lambda: self.finish(True))
+        self.reject_button.clicked.connect(lambda: self.finish(False))
+        buttons.addStretch(1)
+        buttons.addWidget(self.reject_button)
+        buttons.addWidget(self.approve_button)
+        layout.addLayout(buttons)
+        QShortcut(QKeySequence("A"), self, activated=lambda: self.finish(True))
+        QShortcut(QKeySequence("X"), self, activated=lambda: self.finish(False))
+        self.resize(panel_w * 4 + 90, 520)
+
+    def finish(self, approved):
+        if self._decided:
+            return
+        self._decided = True
+        self._decide(self.capture_id, approved)
+        hub.log("Note #%d %s in the approval window." % (self.capture_id, "approved" if approved else "rejected"))
+        self.close()
+
+    def closeEvent(self, event):
+        if not self._decided:       # closing the window without choosing means "do not send"
+            self._decided = True
+            self._decide(self.capture_id, False)
+        super().closeEvent(event)
 
 
 # ---------------------------------------------------------------------- window
@@ -282,6 +354,20 @@ class Console(QMainWindow):
                 self.set_banner(data.get("message"))
             elif kind == "result":
                 self.add_result(data)
+            elif kind == "approval":
+                self.open_approval(data.get("id"))
+
+    def open_approval(self, capture_id):
+        stages = scanner.previews.get(capture_id)
+        if not stages:
+            scanner.decide(capture_id, False)
+            return
+        dialog = ApprovalDialog(self, capture_id, scanner.captures.get(capture_id), stages, scanner.decide)
+        self._approval = dialog        # keep a reference while it is open
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        QApplication.alert(self)
 
     def append_log(self, text, level="info", t=None):
         stamp = time.strftime("%H:%M:%S", time.localtime(t or time.time()))
@@ -444,6 +530,7 @@ def main():
     app.setStyleSheet(STYLE)
     app.setFont(QFont("Segoe UI", 10))
     window = Console()
+    scanner.approval_ui = True          # this console shows the approval window for traced notes
     engine.start("desktop console")
     if cfg.get("desktop", {}).get("api", True):
         try:

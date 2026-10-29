@@ -5,11 +5,17 @@ Manual captures, uploaded test images and API requests are queued to the same wo
 note is ever read at a time (the GPU is shared with the wall scene).
 """
 import collections
+import json
 import queue
 import threading
 import time
+import urllib.request
+import uuid
+
+import cv2
 
 from . import outcome as outcomes
+from . import strokes
 from .detector import Detector
 
 TICK = 0.1
@@ -38,6 +44,9 @@ class Scanner:
         self.paused = False
         self.auto_scan = bool(self.det_cfg.get("auto_scan", True))
         self.captures = collections.OrderedDict()    # id -> JPEG bytes, memory only
+        self.previews = collections.OrderedDict()    # id -> {stage: PNG bytes} for the approval window, memory only
+        self.approval_ui = False                     # the desktop console sets this: it will show the approval window
+        self._decisions = {}                         # id -> [threading.Event, approved]
         self.history = collections.deque(maxlen=50)
         self.reads = 0
         self.total_read_ms = 0
@@ -107,10 +116,12 @@ class Scanner:
             threading.Thread(target=work, name="reader-prepare", daemon=True).start()
 
     def _run(self):
-        self._prepare_reader_async()
+        handwriting = self.cfg["handwriting"]["enabled"]
+        if not handwriting:      # handwriting mode never loads the AI model (it shares the GPU with the wall)
+            self._prepare_reader_async()
         self._enter("starting")
         while not self._stop.is_set():
-            if not self.reader.ready and time.time() >= self._next_prepare:
+            if not handwriting and not self.reader.ready and time.time() >= self._next_prepare:
                 self._prepare_reader_async()
             try:
                 job = self._jobs.get(timeout=TICK)
@@ -251,6 +262,8 @@ class Scanner:
     # ------------------------------------------------------------------ reading
 
     def _read(self, jpeg, source):
+        if self.cfg["handwriting"]["enabled"]:
+            return self._handwriting(jpeg, source)
         capture_id = self._store_capture(jpeg)
         self._enter("reading", "info", "Reading your note...", "This takes a few seconds")
         self.hub.emit("capture", data={"capture_id": capture_id, "source": source, "bytes": len(jpeg)})
@@ -279,6 +292,100 @@ class Scanner:
         self._enter("result", decision["kind"], decision["title"], decision["sub"])
         self._result_until = time.time() + self.det_cfg["result_seconds"]
         return entry
+
+    def decide(self, capture_id, approved):
+        """Called by the console when Approve / Reject is pressed for a traced note."""
+        pending = self._decisions.get(capture_id)
+        if pending:
+            pending[1] = bool(approved)
+            pending[0].set()
+
+    @staticmethod
+    def _png(image, width):
+        h, w = image.shape[:2]
+        resized = cv2.resize(image, (width, max(1, int(h * width / float(w)))), interpolation=cv2.INTER_AREA)
+        return cv2.imencode(".png", resized)[1].tobytes()
+
+    def _stage_pngs(self, traced):
+        stages = traced["stages"]
+        return {"raw": self._png(stages["raw"], 700), "bw": self._png(stages["bw"], 700),
+                "clean": self._png(stages["clean"], 700), "final": self._png(strokes.render_overlay(traced, stages["clean"], 700), 700)}
+
+    def _await_approval(self, capture_id, traced):
+        """Debug gate: show the stages in the console and wait for Approve / Reject. True = send to the wall."""
+        hw = self.cfg["handwriting"]
+        if not (hw.get("require_approval") and self.approval_ui):
+            return True
+        self.previews[capture_id] = self._stage_pngs(traced)
+        while len(self.previews) > self.cfg["privacy"]["keep_last_captures"]:
+            self.previews.popitem(last=False)
+        pending = [threading.Event(), False]
+        self._decisions[capture_id] = pending
+        self._enter("reading", "info", "Waiting for you to check the note...", "Approve it in the console")
+        self.hub.emit("approval", text="Note #%d traced; waiting for approval." % capture_id, data={"id": capture_id})
+        deadline = time.time() + hw.get("approval_timeout_seconds", 180)
+        while not pending[0].wait(0.5):
+            if self._stop.is_set() or time.time() > deadline:
+                break
+        self._decisions.pop(capture_id, None)
+        return pending[1]
+
+    def _handwriting(self, jpeg, source):
+        """Handwriting mode: trace the note's pen strokes and send them to the wall. Nothing is read."""
+        capture_id = self._store_capture(jpeg)
+        self._enter("reading", "info", "Getting your note ready...", "Hold on a moment")
+        self.hub.emit("capture", data={"capture_id": capture_id, "source": source, "bytes": len(jpeg)})
+        started = time.time()
+        decision = {"code": "", "kind": "warning", "title": "", "sub": "Then place it under the camera again",
+                    "name": "", "message": "", "language": "handwriting"}
+        stroke_count = 0
+        try:
+            traced = strokes.extract(jpeg, stages=True)
+            stroke_count = len(traced["strokes"])
+            if stroke_count == 0:
+                decision.update(code="unreadable", title="We couldn't see any writing",
+                                sub="Please write a little bigger and darker, then place it again")
+            elif not self._await_approval(capture_id, traced):
+                decision.update(code="not_approved", title="Note not sent",
+                                sub="Please place it again if you want to try once more")
+            else:
+                reply = self._send_to_wall(traced)
+                if reply.get("status") == "accepted":
+                    decision.update(code="accepted", kind="success", title="Thank you!",
+                                    sub="Your leaf is on its way to the tree")
+                else:
+                    decision.update(code="wall_refused", title="The tree couldn't take your note",
+                                    sub="Please try again in a moment")
+        except ValueError:
+            decision.update(code="unreadable", title="We couldn't see your note",
+                            sub="Please place it flat under the camera")
+        except OSError as e:     # the wall app is not running or not reachable
+            decision.update(code="wall_offline", title="The tree is resting",
+                            sub="Please try again in a moment")
+            self.hub.log("Wall not reachable: %s" % type(e).__name__, "warn")
+
+        total_ms = int((time.time() - started) * 1000)
+        result = {"ok": decision["code"] == "accepted", "name": "", "message": "", "language": "handwriting",
+                  "error": "" if decision["code"] == "accepted" else decision["code"], "timings": {"total_ms": total_ms}}
+        self.reads += 1
+        self.total_read_ms += total_ms
+        entry = {"id": capture_id, "t": time.time(), "source": source, "result": result, "outcome": decision}
+        self.history.appendleft(entry)
+        # Log line on disk: timing and counts only, never the visitor's writing.
+        self.hub.emit("result", level="info" if result["ok"] else "warn", data=entry, text=(
+            "Note #%d (%s): %d strokes in %.1f s -> %s" % (capture_id, source, stroke_count, total_ms / 1000.0, decision["code"])))
+        self._enter("result", decision["kind"], decision["title"], decision["sub"])
+        self._result_until = time.time() + self.det_cfg["result_seconds"]
+        return entry
+
+    def _send_to_wall(self, traced):
+        hw = self.cfg["handwriting"]
+        body = json.dumps({"requestId": uuid.uuid4().hex, "aspect": traced["aspect"],
+                           "strokes": traced["strokes"]}).encode("utf-8")
+        request = urllib.request.Request(hw["wall_url"], data=body, method="POST",
+                                         headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(request, timeout=hw["timeout_seconds"]) as response:
+            return json.loads(response.read().decode("utf-8") or "{}")
 
     def _store_capture(self, jpeg):
         capture_id = self._next_id

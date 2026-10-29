@@ -36,6 +36,12 @@ DEFAULTS = {
     "privacy": {"keep_last_captures": 20},
     # Desktop console: also serve the HTTP API in the background (for the wall app later).
     "desktop": {"api": True},
+    # Handwriting mode: no reading. The note's own pen strokes are traced and sent to the wall,
+    # which draws them in neon on the leaf. The wall URL must be on this PC.
+    "handwriting": {"enabled": True, "wall_url": "http://127.0.0.1:8080/api/v1/notes", "timeout_seconds": 5,
+                    # Debug: in the desktop console, show original / black-and-white / cleaned / neon strokes
+                    # and send to the wall only after Approve. Set false to send straight away.
+                    "require_approval": True, "approval_timeout_seconds": 180},
 }
 
 
@@ -57,6 +63,8 @@ def load(path=None):
     # Never listen on the network: this service handles visitors' handwriting.
     if cfg["host"] not in ("127.0.0.1", "localhost"):
         raise ValueError("config.json 'host' must be 127.0.0.1 (local only)")
+    if not cfg["handwriting"]["wall_url"].startswith(("http://127.0.0.1", "http://localhost")):
+        raise ValueError("config.json handwriting.wall_url must point at this PC (127.0.0.1)")
     if cfg["reader"]["profile"] not in cfg["reader"]["profiles"]:
         raise ValueError("config.json reader.profile must be one of " + ", ".join(cfg["reader"]["profiles"]))
     return cfg
